@@ -14,17 +14,6 @@ from pathlib import Path
 
 import accelforge as af
 
-# Optional per-phase parallelism split to avoid join-phase OOM, WITHOUT changing
-# the metric. Set AF_JOIN_JOBS=N (e.g. 1 or 4) to run make_pmappings at full
-# parallelism (fast) but the memory-heavy join + detail-eval at N workers (less
-# per-worker dataframe duplication => lower peak RSS). The handoff is the pmapping
-# cache: make_pmappings is run once to populate a temp cache, then the full
-# map_workload_to_arch reuses it as a cache hit (so its internal make does no
-# work) and only the join/eval run at the reduced worker count. eval_in_detail is
-# left fully intact, so energy()/latency()/area are bit-for-bit identical to the
-# default path. AF_JOIN_JOBS unset (or 0) => original behavior, untouched.
-_AF_JOIN_JOBS = int(os.environ.get("AF_JOIN_JOBS", "0"))
-
 # The FFM mapper floods stderr with pandas "DataFrame is highly fragmented"
 # PerformanceWarnings; silence them so run.log stays readable.
 warnings.simplefilter("ignore")
