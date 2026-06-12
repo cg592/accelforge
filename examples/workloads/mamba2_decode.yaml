@@ -1,32 +1,8 @@
 # Batched Mamba2 decode step (one layer, single token per sequence, batch=B).
-# Batched variant of mamba2_decode.yaml: a leading batch rank B is threaded
-# through every activation and recurrent-state tensor, while all weights and
-# scalar constants stay shared (un-indexed) and broadcast across the batch.
-# This is the standard batch idiom used in ffn.yaml (B rank, b index).
-#
-# Each of the B sequences is an independent single-token decode step that
-# shares the layer weights; per-sequence quantities that gain a `b` index are:
-# the activations (HNORM, Z/XP/BP/CP, conv states, X/B/C, DBX, Y_*, OUT_BLK,
-# H_OUT, ...), the recurrent SSM_STATE, and the two RMSNorm reductions
-# (PRENORM_*, RMSG_*) — each sequence has its own norm, so those formerly
-# scalar (rank-[]) tensors become rank-[b].
 #
 # Hyperparameters match the Mamba2-2.7B defaults (see mamba2_decode.yaml):
 #   d_model=2560, d_inner=5120, nheads=80, headdim=64, d_state=128, ngroups=1,
 #   d_conv=4, vocab_size=50277 (lm-head not included), num_layers=1.
-#
-# Every rank size (including the batch size B) is jinja-parameterized with the
-# defaults in the parameter block below. Override any on the command line, e.g.
-#   -D B=2 -D D=64 -D H=4 -D P=16 -D N=16
-# to shrink the problem. run_ref_impl defaults to the vectorized pytorch backend,
-# which verifies full size (B=2) in seconds; the small-dim override mainly matters
-# for `--backend numpy`, the point-by-point interpreter whose cost scales with the
-# iteration-space size (the reduction ranks D, H, P, N and the batch rank B blow
-# it up). The math is independent of the dimension sizes. B=2 is the smallest
-# batch that exercises the batched paths.
-# Constraint for the ref impl (which drives mamba_ssm.Mamba2): d_inner = H*P must
-# be an integer multiple of d_model = D (expand = H*P // D >= 1), and ngroups G
-# must divide nheads H.
 #
 # String shorthand ("OUT[r] = IN1[r] * IN2[r]") is used wherever map_op=mul and
 # reduce_op=add (the framework defaults); the expanded entry form is used for
@@ -52,7 +28,7 @@ workload:
     W: {{ W }}   # causal-conv window (default 4)
 
   bits_per_value: {All: 8}
-  # default_dtype: float64                                # functional verif uses fp64; bits_per_value is for cost modeling only
+  # default_dtype: float64  
 
   einsums:
 
