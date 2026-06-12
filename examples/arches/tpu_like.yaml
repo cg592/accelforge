@@ -1,32 +1,10 @@
-# ===== AUTORESEARCH EDITABLE ARCH COPY (clean tpu_v4i_vpu baseline) ==========
-# Generated from tpu_v4i_vpu.yaml for the autoresearch EDP-optimization loop
-# (see ../../program.md). You tune STRUCTURE ONLY: per-action energy/latency and
-# the area-density model are FROZEN. The two on-chip SRAM capacities are exposed
-# as Jinja knobs in the "AUTORESEARCH KNOBS" block (just above `arch:`); every
-# other structural lever (fanouts, spatial dims, dataflow/keep, routing
-# `enabled:`) you edit inline in the arch body.
-# =============================================================================
-
-# ============================ AUTORESEARCH KNOBS =============================
-# TUNABLE -- on-chip SRAM capacities in MB. Edit the default(...) to resize a
-# buffer; its `size` AND `area` are both re-derived below, so area tracks
-# capacity automatically. (Other structural levers -- fanouts, spatial dims,
-# dataflow/keep policies, routing `enabled:` -- you edit inline in the arch body.)
-{% set GLB_MB = GLB_MB | default(128) %}   # GlobalBuffer capacity, MB (baseline 128)
-{% set LB_MB  = LB_MB  | default(16)   %}   # LocalBuffer  capacity, MB (baseline 4, per Z-instance)
-#
-# FROZEN -- do NOT edit. SRAM area density (m^2/bit), anchored to the TPU v4i
-# GlobalBuffer's own calibrated point (112 mm^2 / 128 MB). Marginal-area model
-#   area = baseline_area + density * (bits - baseline_bits)
-# reproduces the paper areas at baseline and prices any resize at a real 7 nm
-# SRAM-macro density (GlobalBuffer => linear through origin; LocalBuffer keeps
-# its ~47.5 mm^2 non-array overhead fixed).
+{% set GLB_MB = GLB_MB | default(128) %}  
+{% set LB_MB  = LB_MB  | default(16)   %}  
 {% set SRAM_M2_PER_BIT = 112e-6 / (128 * 1024 * 1024 * 8) %}
 {% set GLB_BITS = (GLB_MB * 1024 * 1024 * 8) | int %}
 {% set LB_BITS  = (LB_MB  * 1024 * 1024 * 8) | int %}
 {% set GLB_AREA = 112e-6 + SRAM_M2_PER_BIT * (GLB_BITS - 1073741824) %}
 {% set LB_AREA  = 51e-6  + SRAM_M2_PER_BIT * (LB_BITS  - 33554432) %}
-# =============================================================================
 
 arch:
   nodes:
@@ -112,31 +90,6 @@ arch:
     # enabled: len(All) == 3
     enabled: len(All.rank_variables) > len(Outputs.rank_variables)
 
-# Default tensor-role renames so the arch's weight/input/output symbols resolve
-# for every einsum (the mamba2 workload declares no renames of its own).
-#   weight = Nothing  -> Register holds nothing (size 0) by default.
-#   input  = Inputs, output = Outputs.
-#
-# WHY NOT a smarter default (e.g. weight = Inputs & ~Intermediates)? It only
-# resolves correctly in a FULL-workload context (where "Intermediates" knows
-# which tensors are produced upstream). We evaluate per-einsum for cost
-# (spec._for_einsum), and in a single-einsum view NOTHING is intermediate, so
-# `Inputs & ~Intermediates` collapses to ALL inputs -> for any binary einsum
-# `weight` becomes a >=2-tensor set and `weight.bits_per_value` raises. And the
-# full-workload path that WOULD make it resolve correctly is itself blocked here
-# by the copy-einsum `_backing` bug on the conv concats (fires even with fusion
-# disabled). So the smart default is a dead end for this evaluation flow.
-#
-# To get weight-stationary matmuls (so batching amortizes the weight load
-# instead of re-streaming it -> faithful batched latency), put EXPLICIT
-# per-einsum renames on the weight-bearing matmuls, e.g. in the workload:
-#     - "Z[b,h,p] = WZ[h,p,d] * HNORM[b,d]"
-#       renames: {weight: WZ, input: HNORM}
-# That works in the fast per-einsum path (an einsum's own renames override this
-# default and don't depend on intermediate-classification). With weight=WZ the
-# Register is weight-stationary and the reuse_input systolic axis fills with an
-# output rank (h/p); without it (weight=Nothing here) the matmul runs at ~3%
-# MXU utilization and batched latency scales linearly with B.
 renames:
   einsums:
   - name: default
