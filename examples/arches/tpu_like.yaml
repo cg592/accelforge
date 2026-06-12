@@ -1,0 +1,146 @@
+# ===== AUTORESEARCH EDITABLE ARCH COPY (clean tpu_v4i_vpu baseline) ==========
+# Generated from tpu_v4i_vpu.yaml for the autoresearch EDP-optimization loop
+# (see ../../program.md). You tune STRUCTURE ONLY: per-action energy/latency and
+# the area-density model are FROZEN. The two on-chip SRAM capacities are exposed
+# as Jinja knobs in the "AUTORESEARCH KNOBS" block (just above `arch:`); every
+# other structural lever (fanouts, spatial dims, dataflow/keep, routing
+# `enabled:`) you edit inline in the arch body.
+# =============================================================================
+
+# ============================ AUTORESEARCH KNOBS =============================
+# TUNABLE -- on-chip SRAM capacities in MB. Edit the default(...) to resize a
+# buffer; its `size` AND `area` are both re-derived below, so area tracks
+# capacity automatically. (Other structural levers -- fanouts, spatial dims,
+# dataflow/keep policies, routing `enabled:` -- you edit inline in the arch body.)
+{% set GLB_MB = GLB_MB | default(128) %}   # GlobalBuffer capacity, MB (baseline 128)
+{% set LB_MB  = LB_MB  | default(16)   %}   # LocalBuffer  capacity, MB (baseline 4, per Z-instance)
+#
+# FROZEN -- do NOT edit. SRAM area density (m^2/bit), anchored to the TPU v4i
+# GlobalBuffer's own calibrated point (112 mm^2 / 128 MB). Marginal-area model
+#   area = baseline_area + density * (bits - baseline_bits)
+# reproduces the paper areas at baseline and prices any resize at a real 7 nm
+# SRAM-macro density (GlobalBuffer => linear through origin; LocalBuffer keeps
+# its ~47.5 mm^2 non-array overhead fixed).
+{% set SRAM_M2_PER_BIT = 112e-6 / (128 * 1024 * 1024 * 8) %}
+{% set GLB_BITS = (GLB_MB * 1024 * 1024 * 8) | int %}
+{% set LB_BITS  = (LB_MB  * 1024 * 1024 * 8) | int %}
+{% set GLB_AREA = 112e-6 + SRAM_M2_PER_BIT * (GLB_BITS - 1073741824) %}
+{% set LB_AREA  = 51e-6  + SRAM_M2_PER_BIT * (LB_BITS  - 33554432) %}
+# =============================================================================
+
+arch:
+  nodes:
+  - !Memory
+    name: MainMemory
+    size: inf
+    leak_power: 0
+    area: 0 # Don't include off-chip DRAM area
+    actions:
+    - {name: read, energy: 7.03e-12, throughput: 8 * 614e9}
+    - {name: write, energy: 7.03e-12, throughput: 8 * 614e9}
+    tensors: {keep: ~Intermediates, may_keep: All}
+
+  - !Memory
+    name: GlobalBuffer
+    size: {{ GLB_BITS }} # {{ GLB_MB }} MB (autoresearch knob GLB_MB)
+    total_latency: max(a.n_calls / a.throughput for a in actions) # Separate ports
+    leak_power: 0
+    area: {{ GLB_AREA }} # derived from GLB_MB; frozen marginal-area model (baseline 112e-6 = 112 mm^2)
+    actions:
+    - {name: read, energy: 1.88e-12, throughput: 8 * 2048e9}
+    - {name: write, energy: 2.36e-12, throughput: 8 * 1024e9}
+    tensors: {keep: ~MainMemory.tensors, may_keep: All}
+
+  - !Memory
+    name: LocalBuffer
+    size: {{ LB_BITS }} # {{ LB_MB }} MB per Z-instance (autoresearch knob LB_MB)
+    leak_power: 0
+    area: {{ LB_AREA }} # derived from LB_MB; frozen marginal-area model (baseline 51e-6 = 51 mm^2)
+    actions:
+    - {name: read, energy: 0.249e-12, throughput: .inf}
+    - {name: write, energy: 0.293e-12, throughput: .inf}
+    tensors: {keep: input | output}
+
+  - !Compute
+    name: VPU # vector processing unit
+    area: 8.7e-6 / (128 * 16) # From die photo.
+    leak_power: 0
+    n_parallel_instances: 128 * 16
+    actions:
+    - {name: compute, op_kind: mac, fuses: [mul, add], energy: 0, throughput: 1.05e9}
+    - {name: vmul,  op_kind: mul,  energy: 0, throughput: 1.05e9}
+    - {name: vadd,  op_kind: add,  energy: 0, throughput: 1.05e9}
+    - {name: vdiv,  op_kind: div,  energy: 0, throughput: 1.05e9 / 4}
+    - {name: vexp,  op_kind: exp,  energy: 0, throughput: 1.05e9 / 8}
+    - {name: vlog,  op_kind: log,  energy: 0, throughput: 1.05e9 / 8}
+    - {name: vsqrt, op_kind: sqrt, energy: 0, throughput: 1.05e9 / 8}
+    # enabled: len(All) == 2
+    enabled: len(All.rank_variables) == len(Outputs.rank_variables)
+
+  - !Container 
+    name: MXU # matrix processing unit
+    spatial: [{name: Z, fanout: 4, may_reuse: Nothing, min_usage: 1}]
+
+  - !Container
+    name: ProcessingElement
+    spatial:
+    - {name: reuse_input, fanout: 128, may_reuse: input, reuse: input, min_usage: 1}
+    - {name: reuse_output, fanout: 128, may_reuse: output, reuse: output, min_usage: 1}
+
+  - !Memory
+    name: Register
+    size: weight.bits_per_value if weight else 0
+    area: 8.5e-11 # Fig. 6 has 14mm^2 for a 128x128. Assume regs are 10%.
+    leak_power: 0
+    actions:
+    - {name: read, energy: 0, throughput: .inf}
+    - {name: write, energy: 0, throughput: .inf}
+    tensors: {keep: weight}
+
+  - !Compute
+    name: MAC
+    leak_power: 0
+    area: 8.5e-10 # Fig. 6 has 14mm^2 for a 128x128. Assume MAC is 90%.
+    actions:
+    - {name: compute, op_kind: mac, fuses: [mul, add], energy: 0.084e-12, throughput: 1.05e9}
+    - {name: vmul,  op_kind: mul,  energy: 0.084e-12, throughput: 1.05e9}
+    - {name: vadd,  op_kind: add,  energy: 0.030e-12, throughput: 1.05e9}
+    - {name: vdiv,  op_kind: div,  energy: 0.300e-12, throughput: 1.05e9 / 4}
+    - {name: vexp,  op_kind: exp,  energy: 0.500e-12, throughput: 1.05e9 / 8}
+    - {name: vlog,  op_kind: log,  energy: 0.500e-12, throughput: 1.05e9 / 8}
+    - {name: vsqrt, op_kind: sqrt, energy: 0.500e-12, throughput: 1.05e9 / 8}
+    # enabled: len(All) == 3
+    enabled: len(All.rank_variables) > len(Outputs.rank_variables)
+
+# Default tensor-role renames so the arch's weight/input/output symbols resolve
+# for every einsum (the mamba2 workload declares no renames of its own).
+#   weight = Nothing  -> Register holds nothing (size 0) by default.
+#   input  = Inputs, output = Outputs.
+#
+# WHY NOT a smarter default (e.g. weight = Inputs & ~Intermediates)? It only
+# resolves correctly in a FULL-workload context (where "Intermediates" knows
+# which tensors are produced upstream). We evaluate per-einsum for cost
+# (spec._for_einsum), and in a single-einsum view NOTHING is intermediate, so
+# `Inputs & ~Intermediates` collapses to ALL inputs -> for any binary einsum
+# `weight` becomes a >=2-tensor set and `weight.bits_per_value` raises. And the
+# full-workload path that WOULD make it resolve correctly is itself blocked here
+# by the copy-einsum `_backing` bug on the conv concats (fires even with fusion
+# disabled). So the smart default is a dead end for this evaluation flow.
+#
+# To get weight-stationary matmuls (so batching amortizes the weight load
+# instead of re-streaming it -> faithful batched latency), put EXPLICIT
+# per-einsum renames on the weight-bearing matmuls, e.g. in the workload:
+#     - "Z[b,h,p] = WZ[h,p,d] * HNORM[b,d]"
+#       renames: {weight: WZ, input: HNORM}
+# That works in the fast per-einsum path (an einsum's own renames override this
+# default and don't depend on intermediate-classification). With weight=WZ the
+# Register is weight-stationary and the reuse_input systolic axis fills with an
+# output rank (h/p); without it (weight=Nothing here) the matmul runs at ~3%
+# MXU utilization and batched latency scales linearly with B.
+renames:
+  einsums:
+  - name: default
+    tensor_accesses:
+      weight: Nothing
+      input: Inputs
+      output: Outputs

@@ -1,0 +1,448 @@
+# Batched Mamba2 decode step (one layer, single token per sequence, batch=B).
+# Batched variant of mamba2_decode.yaml: a leading batch rank B is threaded
+# through every activation and recurrent-state tensor, while all weights and
+# scalar constants stay shared (un-indexed) and broadcast across the batch.
+# This is the standard batch idiom used in ffn.yaml (B rank, b index).
+#
+# Each of the B sequences is an independent single-token decode step that
+# shares the layer weights; per-sequence quantities that gain a `b` index are:
+# the activations (HNORM, Z/XP/BP/CP, conv states, X/B/C, DBX, Y_*, OUT_BLK,
+# H_OUT, ...), the recurrent SSM_STATE, and the two RMSNorm reductions
+# (PRENORM_*, RMSG_*) — each sequence has its own norm, so those formerly
+# scalar (rank-[]) tensors become rank-[b].
+#
+# Hyperparameters match the Mamba2-2.7B defaults (see mamba2_decode.yaml):
+#   d_model=2560, d_inner=5120, nheads=80, headdim=64, d_state=128, ngroups=1,
+#   d_conv=4, vocab_size=50277 (lm-head not included), num_layers=1.
+#
+# Every rank size (including the batch size B) is jinja-parameterized with the
+# defaults in the parameter block below. Override any on the command line, e.g.
+#   -D B=2 -D D=64 -D H=4 -D P=16 -D N=16
+# to shrink the problem. run_ref_impl defaults to the vectorized pytorch backend,
+# which verifies full size (B=2) in seconds; the small-dim override mainly matters
+# for `--backend numpy`, the point-by-point interpreter whose cost scales with the
+# iteration-space size (the reduction ranks D, H, P, N and the batch rank B blow
+# it up). The math is independent of the dimension sizes. B=2 is the smallest
+# batch that exercises the batched paths.
+# Constraint for the ref impl (which drives mamba_ssm.Mamba2): d_inner = H*P must
+# be an integer multiple of d_model = D (expand = H*P // D >= 1), and ngroups G
+# must divide nheads H.
+#
+# String shorthand ("OUT[r] = IN1[r] * IN2[r]") is used wherever map_op=mul and
+# reduce_op=add (the framework defaults); the expanded entry form is used for
+# any einsum with a non-default op (add map, max reduce, exp/log/sqrt/div, ...)
+# or with a scalar (zero-rank) tensor, which the string syntax can't express.
+
+{% set B = B | default(128)  %}   {# batch size         #}
+{% set D = D | default(2560) %}   {# model dim          #}
+{% set G = G | default(1)    %}   {# num groups         #}
+{% set N = N | default(128)  %}   {# state dim          #}
+{% set H = H | default(80)   %}   {# num heads          #}
+{% set P = P | default(64)   %}   {# head dim           #}
+{% set W = W | default(4)    %}   {# causal-conv window #}
+
+workload:
+  rank_sizes:
+    B: {{ B }}   # batch size         (default 128, independent decode sequences)
+    D: {{ D }}   # model dim          (default 2560)
+    G: {{ G }}   # num groups         (default 1)
+    N: {{ N }}   # state dim          (default 128)
+    H: {{ H }}   # num heads          (default 80)
+    P: {{ P }}   # head dim           (default 64)
+    W: {{ W }}   # causal-conv window (default 4)
+
+  bits_per_value: {All: 8}
+  # default_dtype: float64                                # functional verif uses fp64; bits_per_value is for cost modeling only
+
+  einsums:
+
+  # ---------------------------------------------------------------------------
+  # 0. Pre-norm:  HNORM = RMSNorm(H_IN, PRE_GAMMA, CONST_INV_D)
+  #              = H_IN / sqrt(mean(H_IN**2) + eps) * PRE_GAMMA   (per batch)
+  # ---------------------------------------------------------------------------
+  # Self-multiplication is expressed as a unary einsum with map_op=square:
+  # accelforge disallows a tensor name appearing twice in one einsum, but a
+  # unary "square map + add reduce" charges exactly one mul + one add per iter,
+  # which matches the original FP_MUL/FP_ADD attribution. The reduction is over
+  # d only, so the sum-of-squares is per-batch (rank [b]).
+  - name: prenorm_sumsq                                # PRENORM_SUMSQ[b] = sum_d H_IN[b,d]^2
+    tensor_accesses:
+    - {name: H_IN, projection: [b, d]}
+    - {name: PRENORM_SUMSQ, projection: [b], output: True}
+    map_op: square
+
+  - name: prenorm_mean                                 # PRENORM_MEAN[b] = PRENORM_SUMSQ[b] * (1/D)
+    tensor_accesses:
+    - {name: PRENORM_SUMSQ, projection: [b]}
+    - {name: CONST_INV_D, projection: []}
+    - {name: PRENORM_MEAN, projection: [b], output: True}
+
+  - name: prenorm_addeps                               # PRENORM_MEAN_EPS[b] = PRENORM_MEAN[b] + eps
+    tensor_accesses:
+    - {name: PRENORM_MEAN, projection: [b]}
+    - {name: CONST_EPS, projection: []}
+    - {name: PRENORM_MEAN_EPS, projection: [b], output: True}
+    map_op: add
+
+  - name: prenorm_sqrt                                 # PRENORM_RMS[b] = sqrt(PRENORM_MEAN_EPS[b])
+    tensor_accesses:
+    - {name: PRENORM_MEAN_EPS, projection: [b]}
+    - {name: PRENORM_RMS, projection: [b], output: True}
+    map_op: sqrt
+
+  - name: prenorm_inv_rms                              # PRENORM_INV_RMS[b] = 1 / PRENORM_RMS[b]
+    tensor_accesses:
+    - {name: CONST_ONE, projection: []}
+    - {name: PRENORM_RMS, projection: [b]}
+    - {name: PRENORM_INV_RMS, projection: [b], output: True}
+    map_op: div
+
+  - name: prenorm_normalize                            # PRENORM_Y_NORM[b,d] = H_IN[b,d] * PRENORM_INV_RMS[b]
+    tensor_accesses:
+    - {name: H_IN, projection: [b, d]}
+    - {name: PRENORM_INV_RMS, projection: [b]}
+    - {name: PRENORM_Y_NORM, projection: [b, d], output: True}
+
+  - "HNORM[b, d] = PRENORM_Y_NORM[b, d] * PRE_GAMMA[d]"
+
+  # ---------------------------------------------------------------------------
+  # 1. Input projections.   (weights shared across batch)
+  # ---------------------------------------------------------------------------
+  - {einsum: "Z[b, h, p] = WZ[h, p, d] * HNORM[b, d]", renames: {weight: WZ, input: HNORM}}
+  - {einsum: "XP[b, h, p] = WX[h, p, d] * HNORM[b, d]", renames: {weight: WX, input: HNORM}}
+  - {einsum: "BP[b, g, n] = WB[g, n, d] * HNORM[b, d]", renames: {weight: WB, input: HNORM}}
+  - {einsum: "CP[b, g, n] = WC[g, n, d] * HNORM[b, d]", renames: {weight: WC, input: HNORM}}
+  - {einsum: "DTIN[b, h] = WDT[h, d] * HNORM[b, d]", renames: {weight: WDT, input: HNORM}}
+
+  # ---------------------------------------------------------------------------
+  # 2. dt' = dt_in + dt_bias.
+  # ---------------------------------------------------------------------------
+  - name: DTBIASED
+    tensor_accesses:
+    - {name: DTIN, projection: [b, h]}
+    - {name: DTBIAS, projection: [h]}
+    - {name: DTBIASED, projection: [b, h], output: True}
+    map_op: add
+
+  # ---------------------------------------------------------------------------
+  # 3. dt'' = softplus(dt')  =  log(1 + exp(dt')).
+  # ---------------------------------------------------------------------------
+  - name: DT_SP_EXP                                    # DT_SP_EXP[b,h] = exp(DTBIASED[b,h])
+    tensor_accesses:
+    - {name: DTBIASED, projection: [b, h]}
+    - {name: DT_SP_EXP, projection: [b, h], output: True}
+    map_op: exp
+
+  - name: DT_SP_PLUS1                                  # DT_SP_PLUS1[b,h] = DT_SP_EXP[b,h] + 1
+    tensor_accesses:
+    - {name: DT_SP_EXP, projection: [b, h]}
+    - {name: CONST_ONE, projection: []}
+    - {name: DT_SP_PLUS1, projection: [b, h], output: True}
+    map_op: add
+
+  - name: DT                                           # DT[b,h] = log(DT_SP_PLUS1[b,h])
+    tensor_accesses:
+    - {name: DT_SP_PLUS1, projection: [b, h]}
+    - {name: DT, projection: [b, h], output: True}
+    map_op: log
+
+  # 4. A precomputed; skipped.
+
+  # ---------------------------------------------------------------------------
+  # 5. dA = exp(dt'' * A).   (A shared across batch)
+  # ---------------------------------------------------------------------------
+  - "DTA[b, h] = DT[b, h] * A[h]"
+  - name: DA
+    tensor_accesses:
+    - {name: DTA, projection: [b, h]}
+    - {name: DA, projection: [b, h], output: True}
+    map_op: exp
+
+  # ---------------------------------------------------------------------------
+  # 6. Depth-wise causal conv (reduce over W).   (conv weights shared)
+  # ---------------------------------------------------------------------------
+  # Restructured causal conv (fusion-friendly): each conv output is the sum of
+  # a windowed reduction over the W-1 PRIOR slots and the current-slot product.
+  # No concat copies (no _backing desync), no shared CONV_STATE tensor with
+  # multiple writers, and w stays confined to the prior reduction (no w-bound
+  # conflict) -- so the conv fuses cleanly. Math identical to the concat form
+  # (cross-checked against the original workload).
+
+  - name: X_CONV_PRIOR                                    # reduce over W-1 prior slots
+    tensor_accesses:
+    - {name: XPRIOR, projection: [b, h, p, w]}
+    - {name: W_CONV_X, projection: [h, p, w]}
+    - {name: X_CONV_PRIOR, projection: [b, h, p], output: True}
+    rank_sizes: {W: {{ W - 1 }}}
+    renames: {weight: W_CONV_X, input: XPRIOR}
+  - name: X_CONV_CUR                                      # current slot: XP * W_CONV_X[..,W-1]
+    tensor_accesses:
+    - {name: XP, projection: [b, h, p]}
+    - {name: W_CONV_X_LAST, projection: [h, p]}    # split current tap into its own 2D weight (avoids intersect-empty data space)
+    - {name: X_CONV_CUR, projection: [b, h, p], output: True}
+  - name: X_CONV                                          # X_CONV = X_CONV_PRIOR + X_CONV_CUR
+    tensor_accesses:
+    - {name: X_CONV_PRIOR, projection: [b, h, p]}
+    - {name: X_CONV_CUR, projection: [b, h, p]}
+    - {name: X_CONV, projection: [b, h, p], output: True}
+    map_op: add
+
+  - name: B_CONV_PRIOR                                    # reduce over W-1 prior slots
+    tensor_accesses:
+    - {name: BPRIOR, projection: [b, g, n, w]}
+    - {name: W_CONV_B, projection: [g, n, w]}
+    - {name: B_CONV_PRIOR, projection: [b, g, n], output: True}
+    rank_sizes: {W: {{ W - 1 }}}
+    renames: {weight: W_CONV_B, input: BPRIOR}
+  - name: B_CONV_CUR                                      # current slot: BP * W_CONV_B[..,W-1]
+    tensor_accesses:
+    - {name: BP, projection: [b, g, n]}
+    - {name: W_CONV_B_LAST, projection: [g, n]}    # split current tap (see W_CONV_X_LAST)
+    - {name: B_CONV_CUR, projection: [b, g, n], output: True}
+  - name: B_CONV                                          # B_CONV = B_CONV_PRIOR + B_CONV_CUR
+    tensor_accesses:
+    - {name: B_CONV_PRIOR, projection: [b, g, n]}
+    - {name: B_CONV_CUR, projection: [b, g, n]}
+    - {name: B_CONV, projection: [b, g, n], output: True}
+    map_op: add
+
+  - name: C_CONV_PRIOR                                    # reduce over W-1 prior slots
+    tensor_accesses:
+    - {name: CPRIOR, projection: [b, g, n, w]}
+    - {name: W_CONV_C, projection: [g, n, w]}
+    - {name: C_CONV_PRIOR, projection: [b, g, n], output: True}
+    rank_sizes: {W: {{ W - 1 }}}
+    renames: {weight: W_CONV_C, input: CPRIOR}
+  - name: C_CONV_CUR                                      # current slot: CP * W_CONV_C[..,W-1]
+    tensor_accesses:
+    - {name: CP, projection: [b, g, n]}
+    - {name: W_CONV_C_LAST, projection: [g, n]}    # split current tap (see W_CONV_X_LAST)
+    - {name: C_CONV_CUR, projection: [b, g, n], output: True}
+  - name: C_CONV                                          # C_CONV = C_CONV_PRIOR + C_CONV_CUR
+    tensor_accesses:
+    - {name: C_CONV_PRIOR, projection: [b, g, n]}
+    - {name: C_CONV_CUR, projection: [b, g, n]}
+    - {name: C_CONV, projection: [b, g, n], output: True}
+    map_op: add
+
+  # ---------------------------------------------------------------------------
+  # 7. SiLU on each post-conv tensor:  silu(x) = x * sigmoid(x) = x / (1+exp(-x)).
+  #    Implemented as 5 einsums: neg, exp, +1, recip, mul.
+  # ---------------------------------------------------------------------------
+  # silu(X_CONV) -> X
+  - name: X_SILU_NEG                                   # X_SILU_NEG[b,h,p] = X_CONV[b,h,p] * (-1)
+    tensor_accesses:
+    - {name: X_CONV, projection: [b, h, p]}
+    - {name: CONST_NEG_ONE, projection: []}
+    - {name: X_SILU_NEG, projection: [b, h, p], output: True}
+
+  - name: X_SILU_EXP                                   # X_SILU_EXP[b,h,p] = exp(X_SILU_NEG[b,h,p])
+    tensor_accesses:
+    - {name: X_SILU_NEG, projection: [b, h, p]}
+    - {name: X_SILU_EXP, projection: [b, h, p], output: True}
+    map_op: exp
+
+  - name: X_SILU_DENOM                                 # X_SILU_DENOM[b,h,p] = X_SILU_EXP[b,h,p] + 1
+    tensor_accesses:
+    - {name: X_SILU_EXP, projection: [b, h, p]}
+    - {name: CONST_ONE, projection: []}
+    - {name: X_SILU_DENOM, projection: [b, h, p], output: True}
+    map_op: add
+
+  - name: X_SILU_SIGM                                  # X_SILU_SIGM[b,h,p] = 1 / X_SILU_DENOM[b,h,p]
+    tensor_accesses:
+    - {name: CONST_ONE, projection: []}
+    - {name: X_SILU_DENOM, projection: [b, h, p]}
+    - {name: X_SILU_SIGM, projection: [b, h, p], output: True}
+    map_op: div
+
+  - "X[b, h, p] = X_CONV[b, h, p] * X_SILU_SIGM[b, h, p]"
+
+  # silu(B_CONV) -> B
+  - name: B_SILU_NEG
+    tensor_accesses:
+    - {name: B_CONV, projection: [b, g, n]}
+    - {name: CONST_NEG_ONE, projection: []}
+    - {name: B_SILU_NEG, projection: [b, g, n], output: True}
+
+  - name: B_SILU_EXP
+    tensor_accesses:
+    - {name: B_SILU_NEG, projection: [b, g, n]}
+    - {name: B_SILU_EXP, projection: [b, g, n], output: True}
+    map_op: exp
+
+  - name: B_SILU_DENOM
+    tensor_accesses:
+    - {name: B_SILU_EXP, projection: [b, g, n]}
+    - {name: CONST_ONE, projection: []}
+    - {name: B_SILU_DENOM, projection: [b, g, n], output: True}
+    map_op: add
+
+  - name: B_SILU_SIGM
+    tensor_accesses:
+    - {name: CONST_ONE, projection: []}
+    - {name: B_SILU_DENOM, projection: [b, g, n]}
+    - {name: B_SILU_SIGM, projection: [b, g, n], output: True}
+    map_op: div
+
+  - "B[b, g, n] = B_CONV[b, g, n] * B_SILU_SIGM[b, g, n]"
+
+  # silu(C_CONV) -> C
+  - name: C_SILU_NEG
+    tensor_accesses:
+    - {name: C_CONV, projection: [b, g, n]}
+    - {name: CONST_NEG_ONE, projection: []}
+    - {name: C_SILU_NEG, projection: [b, g, n], output: True}
+
+  - name: C_SILU_EXP
+    tensor_accesses:
+    - {name: C_SILU_NEG, projection: [b, g, n]}
+    - {name: C_SILU_EXP, projection: [b, g, n], output: True}
+    map_op: exp
+
+  - name: C_SILU_DENOM
+    tensor_accesses:
+    - {name: C_SILU_EXP, projection: [b, g, n]}
+    - {name: CONST_ONE, projection: []}
+    - {name: C_SILU_DENOM, projection: [b, g, n], output: True}
+    map_op: add
+
+  - name: C_SILU_SIGM
+    tensor_accesses:
+    - {name: CONST_ONE, projection: []}
+    - {name: C_SILU_DENOM, projection: [b, g, n]}
+    - {name: C_SILU_SIGM, projection: [b, g, n], output: True}
+    map_op: div
+
+  - "C[b, g, n] = C_CONV[b, g, n] * C_SILU_SIGM[b, g, n]"
+
+  # ---------------------------------------------------------------------------
+  # 8. dBx = dt'' * B * x   (two binary outer products; g is reduced out).
+  # ---------------------------------------------------------------------------
+  - "DB_TMP[b, h, n] = DT[b, h] * B[b, g, n]"
+  - "DBX[b, h, p, n] = DB_TMP[b, h, n] * X[b, h, p]"
+
+  # ---------------------------------------------------------------------------
+  # 9/10. ssm_state <- ssm_state * dA + dBx   (in place in the Python source).
+  # accelforge disallows a tensor name from appearing as both input and output
+  # of the same einsum, so we stage the result through fresh tensors instead.
+  # SSM_STATE is per-sequence, so it carries the batch rank b.
+  # ---------------------------------------------------------------------------
+  - "SSM_STATE_DECAYED[b, h, p, n] = SSM_STATE[b, h, p, n] * DA[b, h]"
+
+  - name: state_add                                    # SSM_STATE_NEW = SSM_STATE_DECAYED + DBX
+    tensor_accesses:
+    - {name: SSM_STATE_DECAYED, projection: [b, h, p, n]}
+    - {name: DBX, projection: [b, h, p, n]}
+    - {name: SSM_STATE_NEW, projection: [b, h, p, n], output: True}
+    map_op: add
+
+  # ---------------------------------------------------------------------------
+  # 11. y_ssm = sum_{g,n} ssm_state * C.
+  # ---------------------------------------------------------------------------
+  - "Y_SSM[b, h, p] = SSM_STATE_NEW[b, h, p, n] * C[b, g, n]"
+
+  # ---------------------------------------------------------------------------
+  # 12. y_pre = y_ssm + D_skip * x.   (D_skip shared)
+  # ---------------------------------------------------------------------------
+  - "Y_SKIP[b, h, p] = D_SKIP[h] * X[b, h, p]"
+
+  - name: y_add                                        # Y_PRE = Y_SSM + Y_SKIP
+    tensor_accesses:
+    - {name: Y_SSM, projection: [b, h, p]}
+    - {name: Y_SKIP, projection: [b, h, p]}
+    - {name: Y_PRE, projection: [b, h, p], output: True}
+    map_op: add
+
+  # ---------------------------------------------------------------------------
+  # 13. Y_NORM = RMSNormGated(Y_PRE, Z) * NORM_GAMMA   (norm_before_gate=False)
+  #            = RMSNorm(Y_PRE * SiLU(Z)) * NORM_GAMMA   over (h, p), per batch.
+  # ---------------------------------------------------------------------------
+  # 13a. SiLU on Z -> RMSG_Z_SILU_OUT (5 einsums).
+  - name: RMSG_Z_SILU_NEG
+    tensor_accesses:
+    - {name: Z, projection: [b, h, p]}
+    - {name: CONST_NEG_ONE, projection: []}
+    - {name: RMSG_Z_SILU_NEG, projection: [b, h, p], output: True}
+
+  - name: RMSG_Z_SILU_EXP
+    tensor_accesses:
+    - {name: RMSG_Z_SILU_NEG, projection: [b, h, p]}
+    - {name: RMSG_Z_SILU_EXP, projection: [b, h, p], output: True}
+    map_op: exp
+
+  - name: RMSG_Z_SILU_DENOM
+    tensor_accesses:
+    - {name: RMSG_Z_SILU_EXP, projection: [b, h, p]}
+    - {name: CONST_ONE, projection: []}
+    - {name: RMSG_Z_SILU_DENOM, projection: [b, h, p], output: True}
+    map_op: add
+
+  - name: RMSG_Z_SILU_SIGM
+    tensor_accesses:
+    - {name: CONST_ONE, projection: []}
+    - {name: RMSG_Z_SILU_DENOM, projection: [b, h, p]}
+    - {name: RMSG_Z_SILU_SIGM, projection: [b, h, p], output: True}
+    map_op: div
+
+  - "RMSG_Z_SILU_OUT[b, h, p] = Z[b, h, p] * RMSG_Z_SILU_SIGM[b, h, p]"
+
+  # 13b. Gate: Y_PRE * silu(Z).
+  - "RMSG_Y_GATED[b, h, p] = Y_PRE[b, h, p] * RMSG_Z_SILU_OUT[b, h, p]"
+
+  # 13c. RMSNorm on RMSG_Y_GATED with NORM_GAMMA and 1/(H*P) (7 einsums).
+  #      Reduction is over (h,p) only, so the norm is per-batch (rank [b]).
+  - name: RMSG_SUMSQ                                   # sum over (h,p) of Y_GATED^2, per batch
+    tensor_accesses:
+    - {name: RMSG_Y_GATED, projection: [b, h, p]}
+    - {name: RMSG_SUMSQ, projection: [b], output: True}
+    map_op: square                                     # same trick as prenorm_sumsq
+
+  - name: RMSG_MEAN
+    tensor_accesses:
+    - {name: RMSG_SUMSQ, projection: [b]}
+    - {name: CONST_INV_HP, projection: []}
+    - {name: RMSG_MEAN, projection: [b], output: True}
+
+  - name: RMSG_MEAN_EPS
+    tensor_accesses:
+    - {name: RMSG_MEAN, projection: [b]}
+    - {name: CONST_EPS, projection: []}
+    - {name: RMSG_MEAN_EPS, projection: [b], output: True}
+    map_op: add
+
+  - name: RMSG_RMS
+    tensor_accesses:
+    - {name: RMSG_MEAN_EPS, projection: [b]}
+    - {name: RMSG_RMS, projection: [b], output: True}
+    map_op: sqrt
+
+  - name: RMSG_INV_RMS
+    tensor_accesses:
+    - {name: CONST_ONE, projection: []}
+    - {name: RMSG_RMS, projection: [b]}
+    - {name: RMSG_INV_RMS, projection: [b], output: True}
+    map_op: div
+
+  - name: RMSG_Y_NORM                                  # Y_GATED[b,h,p] * INV_RMS[b] (per-batch scalar broadcast)
+    tensor_accesses:
+    - {name: RMSG_Y_GATED, projection: [b, h, p]}
+    - {name: RMSG_INV_RMS, projection: [b]}
+    - {name: RMSG_Y_NORM, projection: [b, h, p], output: True}
+
+  - "Y_NORM[b, h, p] = RMSG_Y_NORM[b, h, p] * NORM_GAMMA[h, p]"
+
+  # ---------------------------------------------------------------------------
+  # 14. Output projection:  out_blk = W_out @ y_norm.   (W_out shared)
+  # ---------------------------------------------------------------------------
+  - {einsum: "OUT_BLK[b, d] = W_OUT[d, h, p] * Y_NORM[b, h, p]", renames: {weight: W_OUT, input: Y_NORM}}
+
+  # ---------------------------------------------------------------------------
+  # 15. Residual:  h_out = h_in + out_blk.
+  # ---------------------------------------------------------------------------
+  - name: residual
+    tensor_accesses:
+    - {name: H_IN, projection: [b, d]}
+    - {name: OUT_BLK, projection: [b, d]}
+    - {name: H_OUT, projection: [b, d], output: True}
+    map_op: add
