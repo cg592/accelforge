@@ -27,6 +27,7 @@ def evaluate_one(arch_path: Path, workload_path: Path, batch: int) -> tuple[floa
     """Map the workload at batch size `batch` onto `arch_path`; return
     (energy_J, latency_s, area_m2). Raises on any failure."""
     spec = af.Spec.from_yaml(str(arch_path), str(workload_path), B=batch)
+    spec.mapper.objective_tolerance = 1.2
     area_m2 = float(spec.calculate_component_costs().arch.total_area)
     mappings = spec.map_workload_to_arch(print_progress=False, print_number_of_pmappings=True, one_pbar_only=True)
     m = mappings[0] 
